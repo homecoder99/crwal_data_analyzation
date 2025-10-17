@@ -7,9 +7,10 @@ import logging
 import json
 import time
 import random
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Any
 from pathlib import Path
-from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
 from asyncio_throttle import Throttler
 import aiofiles
 
@@ -19,6 +20,84 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def clean_text(text: str) -> str:
+    """텍스트 정리 헬퍼 함수"""
+    if not text:
+        return ""
+    return text.strip().replace('\n', '').replace('\r', '')
+
+class OliveYoungOptionExtractor:
+    """Oliveyoung 상품 옵션 정보 추출 클래스"""
+
+    def __init__(self, logger):
+        self.logger = logger
+
+    async def extract_option_info(self, page: Page, product_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """옵션 정보 추출 - 각 옵션별 품절 상태 포함"""
+        options = []
+
+        try:
+            option_button = page.locator('#buyOpt')
+            if await option_button.count() == 0:
+                self.logger.debug("옵션 버튼 없음 - 단품 상품")
+                return options
+
+            self.logger.debug("옵션 버튼 클릭")
+            await option_button.click()
+
+            # 옵션 목록 로딩 대기
+            try:
+                await page.wait_for_selector('#option_list li', timeout=8000)
+                await asyncio.sleep(1)
+
+                # 옵션 아이템 추출
+                option_items = page.locator('#option_list li')
+                item_count = await option_items.count()
+
+                if item_count > 0:
+                    self.logger.debug(f"옵션 {item_count}개 발견")
+
+                    for i in range(min(item_count, 50)):  # 최대 50개
+                        item = option_items.nth(i)
+
+                        # 옵션명
+                        option_name_element = item.locator('.option_value')
+                        if await option_name_element.count() == 0:
+                            continue
+
+                        option_name = clean_text(await option_name_element.inner_text())
+                        if not option_name:
+                            continue
+
+                        # 품절 여부
+                        is_soldout = await item.evaluate('el => el.classList.contains("soldout")')
+
+                        # 옵션 가격
+                        option_price = 0
+                        price_element = item.locator('.tx_num')
+                        if await price_element.count() > 0:
+                            price_text = clean_text(await price_element.inner_text())
+                            price_match = re.search(r'([\d,]+)', price_text)
+                            if price_match:
+                                option_price = int(price_match.group(1).replace(',', ''))
+
+                        options.append({
+                            "index": i + 1,
+                            "name": option_name,
+                            "price": option_price,
+                            "is_soldout": is_soldout
+                        })
+
+                    self.logger.debug(f"옵션 정보 추출 완료: {len(options)}개")
+
+            except PlaywrightTimeoutError:
+                self.logger.debug("옵션 로딩 타임아웃")
+
+        except Exception as e:
+            self.logger.debug(f"옵션 정보 추출 실패: {e}")
+
+        return options
 
 class OliveYoungCrawler:
     def __init__(self, 
@@ -56,9 +135,11 @@ class OliveYoungCrawler:
         
         # Throttler 설정 (동시 요청 제한)
         self.throttler = Throttler(rate_limit=max_concurrent, period=1.0)
-        
 
-    
+        # 옵션 추출기
+        self.option_extractor = OliveYoungOptionExtractor(logger)
+
+
     async def create_browser_context(self, browser: Browser) -> BrowserContext:
         """CloudFlare 우회를 위한 브라우저 컨텍스트 생성"""
         logger.info("🌐 브라우저 컨텍스트 생성 중 (CloudFlare 우회 설정)")
@@ -139,27 +220,18 @@ class OliveYoungCrawler:
                 # 페이지 제목 확인
                 title = await page.title()
                 
-                # 상품 정보 추출 (기본 정보만)
+                # 상품 정보 추출 (기본 정보)
                 product_data = {
                     'product_id': product_id,
                     'url': url,
                     'title': title,
                     'status_code': response.status,
                     'crawl_time': time.time() - start_time,
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'has_options': False,
+                    'option_count': 0,
+                    'options': []
                 }
-                
-                # # 추가 상품 정보 추출 시도
-                # try:
-                #     # 상품명 추출
-                #     product_name = await page.query_selector('.prd_name')
-                #     if product_name:
-                #         product_data['product_name'] = await product_name.text_content()
-                    
-                #     # 가격 정보 추출
-                #     price_element = await page.query_selector('.price')
-                #     if price_element:
-                #         product_data['price'] = await price_element.text_content()
 
                 # 물품 정상 판매 여부 확인
                 try:
@@ -169,20 +241,40 @@ class OliveYoungCrawler:
                         product_data['product_status'] = 'soldOut'
                         product_data['soldout_reason'] = 'product_not_found'
                     else:
-                        # 두 번째 확인: 바로구매 버튼의 display 스타일
-                        buy_button = await page.query_selector('button.btnBuy.goods_buy#cartBtn')
-                        if buy_button:
-                            button_style = await buy_button.get_attribute('style')
-                            if button_style and 'display: none' in button_style:
+                        # 옵션 정보 추출
+                        options = await self.option_extractor.extract_option_info(page, product_data)
+
+                        if options:
+                            # 옵션 상품
+                            product_data['has_options'] = True
+                            product_data['option_count'] = len(options)
+                            product_data['options'] = options
+
+                            # 전체 옵션이 품절인지 확인
+                            all_soldout = all(opt['is_soldout'] for opt in options)
+                            any_available = any(not opt['is_soldout'] for opt in options)
+
+                            if all_soldout:
                                 product_data['product_status'] = 'soldOut'
-                                product_data['soldout_reason'] = 'button_hidden'
-                            else:
+                                product_data['soldout_reason'] = 'all_options_soldout'
+                            elif any_available:
                                 product_data['product_status'] = 'saleOn'
+                            else:
+                                product_data['product_status'] = 'unknown'
                         else:
-                            # 버튼이 없으면 판매 종료로 간주
-                            product_data['product_status'] = 'soldOut'
-                            product_data['soldout_reason'] = 'button_not_found'
-                        
+                            # 단품 상품
+                            buy_button = await page.query_selector('button.btnBuy.goods_buy#cartBtn')
+                            if buy_button:
+                                button_style = await buy_button.get_attribute('style')
+                                if button_style and 'display: none' in button_style:
+                                    product_data['product_status'] = 'soldOut'
+                                    product_data['soldout_reason'] = 'button_hidden'
+                                else:
+                                    product_data['product_status'] = 'saleOn'
+                            else:
+                                product_data['product_status'] = 'soldOut'
+                                product_data['soldout_reason'] = 'button_not_found'
+
                 except Exception as e:
                     logger.warning(f"⚠️  상품 판매 상태 확인 실패 (ID: {product_id}): {str(e)}")
                     product_data['product_status'] = 'unknown'
