@@ -27,6 +27,105 @@ def clean_text(text: str) -> str:
         return ""
     return text.strip().replace('\n', '').replace('\r', '')
 
+def parse_price(price_text: str) -> int:
+    """가격 텍스트를 정수로 파싱"""
+    if not price_text:
+        return 0
+    # "27,600원" -> 27600
+    price_str = re.sub(r'[^\d]', '', price_text)
+    return int(price_str) if price_str else 0
+
+def convert_krw_to_jpy(krw_price: int) -> int:
+    """한화를 엔화로 변환 (배송비, 마진율, 환율, 끝자리 보정 포함)"""
+    # 배송비 추가
+    shipping_cost = 7500
+    price_with_shipping = krw_price + shipping_cost
+
+    # 마진율 적용
+    margin_rate = 1.0
+    price_with_margin = int(price_with_shipping * margin_rate)
+
+    # 엔화 환율 적용
+    krw_to_jpy_rate = 0.11
+    price_jpy_raw = int(price_with_margin * krw_to_jpy_rate)
+
+    # 가격 끝자리 보정 (8, 9, 0)
+    return adjust_price_ending(price_jpy_raw)
+
+def adjust_price_ending(price: int) -> int:
+    """가격을 끝자리가 8, 9, 0인 값으로 자동 보정"""
+    rounded_price = round(price)
+    last_digit = rounded_price % 10
+
+    if last_digit <= 4:
+        adjustment = 0  # 0으로 맞춤
+    elif last_digit <= 8:
+        adjustment = 8  # 8로 맞춤
+    else:
+        adjustment = 9  # 9로 맞춤
+
+    adjusted_price = rounded_price - last_digit + adjustment
+    return adjusted_price
+
+class OliveYoungPriceExtractor:
+    """Oliveyoung 가격 정보 추출 클래스"""
+
+    def __init__(self, logger):
+        self.logger = logger
+
+    async def extract_price_info(self, page: Page, product_data: Dict[str, Any]):
+        """가격 정보 추출"""
+        try:
+            # 1. 판매가 추출 (필수)
+            await self._extract_sale_price(page, product_data)
+
+            # 2. 정상가 추출 및 할인 여부 판단
+            await self._extract_origin_price(page, product_data)
+
+            # 3. 엔화 가격 계산
+            if product_data.get("is_discounted", False):
+                # 할인가를 엔화로 변환
+                krw_price = product_data.get("price", 0)
+            else:
+                # 정상가를 엔화로 변환
+                krw_price = product_data.get("origin_price", product_data.get("price", 0))
+
+            product_data["price_jpy"] = convert_krw_to_jpy(krw_price)
+            self.logger.debug(f"Oliveyoung 엔화 가격: {product_data['price_jpy']}엔 (원화: {krw_price}원)")
+
+        except Exception as e:
+            self.logger.debug(f"Oliveyoung 가격 정보 추출 실패: {str(e)}")
+            product_data["price"] = 0
+            product_data["origin_price"] = 0
+            product_data["is_discounted"] = False
+            product_data["price_jpy"] = 0
+
+    async def _extract_sale_price(self, page: Page, product_data: Dict[str, Any]):
+        """판매가 추출"""
+        price_element = page.locator('.price-2 strong')
+        if await price_element.count() > 0:
+            price_text = await price_element.inner_text()
+            product_data["price"] = parse_price(price_text)
+            self.logger.debug(f"Oliveyoung 판매가 추출: {product_data['price']}")
+        else:
+            self.logger.debug("Oliveyoung 판매가(.price-2 strong)를 찾을 수 없음")
+            product_data["price"] = 0
+
+    async def _extract_origin_price(self, page: Page, product_data: Dict[str, Any]):
+        """정상가 추출 및 할인 여부 판단"""
+        origin_price_element = page.locator('.price-1 strike')
+        if await origin_price_element.count() > 0:
+            # 할인 중인 경우
+            origin_price_text = await origin_price_element.inner_text()
+            product_data["origin_price"] = parse_price(origin_price_text)
+            product_data["is_discounted"] = True
+            self.logger.debug(f"Oliveyoung 정상가 추출 (할인 중): {product_data['origin_price']}")
+        else:
+            # 할인 없는 경우
+            product_data["origin_price"] = product_data.get("price", 0)
+            product_data["is_discounted"] = False
+            self.logger.debug("Oliveyoung 할인 없음 - 정상가와 판매가 동일")
+
 class OliveYoungOptionExtractor:
     """Oliveyoung 상품 옵션 정보 추출 클래스"""
 
@@ -34,7 +133,7 @@ class OliveYoungOptionExtractor:
         self.logger = logger
 
     async def extract_option_info(self, page: Page, product_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """옵션 정보 추출 - 각 옵션별 품절 상태 포함"""
+        """옵션 정보 추출 - 각 옵션별 품절 상태 및 가격 검증 포함"""
         options = []
 
         try:
@@ -49,7 +148,7 @@ class OliveYoungOptionExtractor:
             # 옵션 목록 로딩 대기
             try:
                 await page.wait_for_selector('#option_list li', timeout=8000)
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)  # 2초 대기로 변경
 
                 # 옵션 아이템 추출
                 option_items = page.locator('#option_list li')
@@ -57,6 +156,10 @@ class OliveYoungOptionExtractor:
 
                 if item_count > 0:
                     self.logger.debug(f"옵션 {item_count}개 발견")
+
+                    # 기본 판매가 (가격 검증용)
+                    base_price = product_data.get("price", 0)
+                    valid_option_count = 0
 
                     for i in range(min(item_count, 50)):  # 최대 50개
                         item = option_items.nth(i)
@@ -73,7 +176,7 @@ class OliveYoungOptionExtractor:
                         # 품절 여부
                         is_soldout = await item.evaluate('el => el.classList.contains("soldout")')
 
-                        # 옵션 가격
+                        # 옵션 가격 (.tx_num 클래스)
                         option_price = 0
                         price_element = item.locator('.tx_num')
                         if await price_element.count() > 0:
@@ -82,14 +185,32 @@ class OliveYoungOptionExtractor:
                             if price_match:
                                 option_price = int(price_match.group(1).replace(',', ''))
 
+                        # 가격 검증: ±50% 초과 시 제외
+                        if base_price > 0 and option_price > 0:
+                            additional_price = option_price - base_price
+                            if additional_price < -(base_price * 0.5) or additional_price > base_price * 0.5:
+                                self.logger.warning(
+                                    f"옵션 가격이 상품 가격 ±50% 초과: {option_name} "
+                                    f"(추가금액: {additional_price}) - 상품에서 제외"
+                                )
+                                continue
+
+                        # 유효한 옵션만 추가
                         options.append({
-                            "index": i + 1,
+                            "index": valid_option_count + 1,
                             "name": option_name,
                             "price": option_price,
+                            "price_krw": option_price,  # 한화 가격 (옵션)
                             "is_soldout": is_soldout
                         })
+                        valid_option_count += 1
 
-                    self.logger.debug(f"옵션 정보 추출 완료: {len(options)}개")
+                    # 옵션이 1개만 있으면 단품으로 처리
+                    if len(options) == 1:
+                        self.logger.info(f"옵션 1개만 존재: 단일 상품으로 변경")
+                        return []  # 빈 리스트 반환하여 단품 처리
+
+                    self.logger.debug(f"옵션 정보 추출 완료: {len(options)}개 (가격 검증 후)")
 
             except PlaywrightTimeoutError:
                 self.logger.debug("옵션 로딩 타임아웃")
@@ -135,6 +256,9 @@ class OliveYoungCrawler:
         
         # Throttler 설정 (동시 요청 제한)
         self.throttler = Throttler(rate_limit=max_concurrent, period=1.0)
+
+        # 가격 추출기
+        self.price_extractor = OliveYoungPriceExtractor(logger)
 
         # 옵션 추출기
         self.option_extractor = OliveYoungOptionExtractor(logger)
@@ -241,6 +365,9 @@ class OliveYoungCrawler:
                         product_data['product_status'] = 'soldOut'
                         product_data['soldout_reason'] = 'product_not_found'
                     else:
+                        # 가격 정보 추출
+                        await self.price_extractor.extract_price_info(page, product_data)
+
                         # 옵션 정보 추출
                         options = await self.option_extractor.extract_option_info(page, product_data)
 
@@ -249,6 +376,11 @@ class OliveYoungCrawler:
                             product_data['has_options'] = True
                             product_data['option_count'] = len(options)
                             product_data['options'] = options
+
+                            # 각 옵션별 엔화 가격 계산
+                            for option in options:
+                                option_krw_price = option.get('price_krw', 0)
+                                option['price_jpy'] = convert_krw_to_jpy(option_krw_price)
 
                             # 전체 옵션이 품절인지 확인
                             all_soldout = all(opt['is_soldout'] for opt in options)

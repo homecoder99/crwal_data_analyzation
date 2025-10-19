@@ -20,6 +20,7 @@ class ExcelProcessor:
         self.excel_path = Path(excel_path)
         self.df = None
         self.filtered_ids = []
+        self.price_map = {}  # ID별 가격 정보 저장
         
     def load_excel(self) -> bool:
         """Excel 파일을 로드하고 기본 정보를 로깅"""
@@ -83,6 +84,48 @@ class ExcelProcessor:
     def get_filtered_ids(self) -> List[str]:
         """필터링된 ID 목록 반환"""
         return self.filtered_ids
+
+    def load_price_info(self):
+        """Excel에서 가격 정보 로드 (엔화)"""
+        if self.df is None:
+            logger.warning("⚠️  Excel 파일이 로드되지 않았습니다")
+            return
+
+        # 가격 컬럼 확인 (엔화 가격 컬럼 이름 확인 필요)
+        price_column = None
+        possible_price_columns = ['price', 'item_price', 'selling_price', '판매가', '가격']
+
+        for col in possible_price_columns:
+            if col in self.df.columns:
+                price_column = col
+                break
+
+        if price_column:
+            logger.info(f"💰 가격 컬럼 발견: {price_column}")
+
+            for _, row in self.df.iterrows():
+                seller_id = str(row.get('seller_unique_item_id', '')).strip()
+
+                # oliveyoung_A로 시작하는 ID인 경우
+                if seller_id.startswith('oliveyoung_A'):
+                    # oliveyoung_ 접두사 제거
+                    product_id = seller_id.replace('oliveyoung_', '', 1)
+                    price_value = row.get(price_column, 0)
+
+                    # 가격이 숫자인지 확인
+                    try:
+                        price_jpy = int(price_value) if price_value else 0
+                        self.price_map[product_id] = price_jpy
+                    except (ValueError, TypeError):
+                        logger.debug(f"⚠️  가격 파싱 실패: {seller_id}, {price_value}")
+
+            logger.info(f"✅ 가격 정보 로드 완료: {len(self.price_map)}개")
+        else:
+            logger.warning(f"⚠️  가격 컬럼을 찾을 수 없습니다. 사용 가능한 컬럼: {list(self.df.columns)}")
+
+    def get_price_jpy(self, product_id: str) -> Optional[int]:
+        """상품 ID의 엔화 가격 반환"""
+        return self.price_map.get(product_id)
     
     def process(self) -> Optional[List[str]]:
         """메인 처리 메소드 - 데이터 로드 및 필터링"""
@@ -98,11 +141,14 @@ class ExcelProcessor:
             
         # ID 필터링
         filtered_ids = self.filter_ids_starting_with_a()
-        
+
         if len(filtered_ids) == 0:
             logger.warning("⚠️  처리할 유효한 ID가 없습니다")
             return None
-            
+
+        # 가격 정보 로드
+        self.load_price_info()
+
         logger.info(f"✅ Excel 처리 완료. {len(filtered_ids)}개 ID 처리 준비됨")
         return filtered_ids
 
