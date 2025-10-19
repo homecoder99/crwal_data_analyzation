@@ -52,7 +52,7 @@ class CrawlingResultAnalyzer:
             # 가격 컬럼 찾기
             price_column = None
             option_column = None
-            possible_price_columns = ['price', 'item_price', 'selling_price', '판매가', '가격']
+            possible_price_columns = ['price_yen', 'price', 'item_price', 'selling_price', '판매가', '가격']
             possible_option_columns = ['option_info', 'options', 'option', '옵션정보']
 
             for col in possible_price_columns:
