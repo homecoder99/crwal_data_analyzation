@@ -42,4 +42,5 @@ Thumbs.db
 temp/
 tmp/
 
+# 결과 파일
 *.txt
