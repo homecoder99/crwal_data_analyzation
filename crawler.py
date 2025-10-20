@@ -378,9 +378,15 @@ class OliveYoungCrawler:
                             product_data['options'] = options
 
                             # 각 옵션별 엔화 가격 계산
+                            # 방식: 기본가(JPY) + (옵션추가가격(KRW) * 0.11)
+                            base_price_krw = product_data.get('price', 0)
+                            base_price_jpy = product_data.get('price_jpy', 0)
+
                             for option in options:
-                                option_krw_price = option.get('price_krw', 0)
-                                option['price_jpy'] = convert_krw_to_jpy(option_krw_price)
+                                option_price_krw = option.get('price_krw', 0)
+                                additional_price_krw = option_price_krw - base_price_krw
+                                additional_price_jpy = int(additional_price_krw * 0.11)
+                                option['price_jpy'] = base_price_jpy + additional_price_jpy
 
                             # 전체 옵션이 품절인지 확인
                             all_soldout = all(opt['is_soldout'] for opt in options)
