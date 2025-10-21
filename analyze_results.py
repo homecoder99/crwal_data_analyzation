@@ -246,38 +246,61 @@ class CrawlingResultAnalyzer:
 
         return successful_ids
 
-    def extract_price_changed_products(self) -> Dict[str, List[Tuple[str, int, int]]]:
-        """가격이 변경된 상품/옵션 추출 (단품/옵션 분리)
+    def extract_price_changed_products(self) -> Dict[str, List[Tuple]]:
+        """가격이 변경된 상품/옵션 추출 (단품/옵션 기본가/옵션 차액 분리)
 
         Returns:
             {
                 'single': [(product_id, old_price, new_price), ...],
-                'option': [(product_id, option_id, old_price, new_price), ...]
+                'option_base': [(product_id, option_id, old_base, new_base), ...],
+                'option_additional': [(product_id, option_id, old_additional, new_additional), ...]
             }
         """
         if not self.data or 'products' not in self.data:
-            return {'single': [], 'option': []}
+            return {'single': [], 'option_base': [], 'option_additional': []}
 
         if not self.excel_price_map:
             print("⚠️  Excel 가격 정보가 없어 가격 비교를 수행할 수 없습니다")
-            return {'single': [], 'option': []}
+            return {'single': [], 'option_base': [], 'option_additional': []}
 
-        price_changed = {'single': [], 'option': []}
+        price_changed = {'single': [], 'option_base': [], 'option_additional': []}
 
         for product in self.data['products']:
             product_id = product['product_id']
 
             # 옵션 상품인 경우
             if product.get('has_options', False):
+                base_price_new = product.get('price_jpy', 0)  # 현재 기본 가격
+                base_price_old = self.excel_price_map.get(product_id, 0)  # Excel 기본 가격
+
+                base_changed = (base_price_new > 0 and base_price_old > 0 and
+                               base_price_new != base_price_old)
+
                 options = product.get('options', [])
                 for option in options:
                     option_id = f"{product_id}_{option['index']}"
-                    new_price_jpy = option.get('price_jpy', 0)
-                    old_price_jpy = self.excel_price_map.get(option_id, 0)
+                    option_price_new = option.get('price_jpy', 0)  # 옵션 전체 가격
+                    option_price_old = self.excel_price_map.get(option_id, 0)  # Excel 옵션 전체 가격
 
-                    # 가격이 있고, 변경되었으면 추가
-                    if new_price_jpy > 0 and old_price_jpy > 0 and new_price_jpy != old_price_jpy:
-                        price_changed['option'].append((product_id, option_id, old_price_jpy, new_price_jpy))
+                    # 차액 계산 (전체 가격 - 기본 가격)
+                    additional_new = option_price_new - base_price_new
+                    additional_old = option_price_old - base_price_old
+
+                    additional_changed = (additional_new != additional_old)
+
+                    # 케이스 1: 기본가격만 변경
+                    if base_changed and not additional_changed:
+                        price_changed['option_base'].append((product_id, option_id, base_price_old, base_price_new))
+
+                    # 케이스 2: 차액만 변경
+                    elif not base_changed and additional_changed:
+                        price_changed['option_additional'].append((product_id, option_id, additional_old, additional_new))
+
+                    # 케이스 3: 둘 다 변경
+                    elif base_changed and additional_changed:
+                        price_changed['option_base'].append((product_id, option_id, base_price_old, base_price_new))
+                        price_changed['option_additional'].append((product_id, option_id, additional_old, additional_new))
+
             else:
                 # 단품 상품인 경우
                 new_price_jpy = product.get('price_jpy', 0)
@@ -312,13 +335,18 @@ class CrawlingResultAnalyzer:
         for product in self.data['products']:
             product_id = product['product_id']
 
-            # 크롤링 성공한 상품만 확인
-            if product.get('status') != 'success':
+            # 크롤링 성공 여부 확인 (status가 success이거나, product_status가 정상적으로 있는 경우)
+            status = product.get('status')
+            product_status = product.get('product_status', 'unknown')
+
+            # 크롤링 실패하거나 상품 상태를 알 수 없는 경우 스킵
+            if status in ['timeout', 'error', 'failed'] or product_status == 'unknown':
                 continue
 
             # 옵션 상품인 경우
             if product.get('has_options', False):
                 options = product.get('options', [])
+
                 for option in options:
                     option_id = f"{product_id}_{option['index']}"
                     old_quantity = self.excel_quantity_map.get(option_id, -1)
@@ -330,7 +358,6 @@ class CrawlingResultAnalyzer:
             else:
                 # 단품 상품인 경우
                 old_quantity = self.excel_quantity_map.get(product_id, -1)
-                product_status = product.get('product_status', 'unknown')
 
                 # Excel에서 품절(0)이었는데, 현재 판매중인 경우
                 if old_quantity == 0 and product_status == 'saleOn':
@@ -339,13 +366,13 @@ class CrawlingResultAnalyzer:
         return restocked
 
     def extract_deleted_products(self) -> Dict[str, List[Tuple]]:
-        """삭제된 상품 감지 (크롤링 실패 + 404 등)
+        """삭제된 상품 감지 (soldout_reason으로 판단)
 
-        크롤링 결과 timeout이나 error가 발생한 경우 삭제 가능성
+        soldout_reason이 'product_not_found'인 경우 삭제로 판단
 
         Returns:
             {
-                'single': [(product_id, status, error), ...],
+                'single': [(product_id, soldout_reason, description), ...],
                 'option': []  # 옵션 상품은 상품 전체가 삭제되므로 single에만 포함
             }
         """
@@ -356,16 +383,17 @@ class CrawlingResultAnalyzer:
 
         for product in self.data['products']:
             product_id = product['product_id']
-            status = product.get('status', 'unknown')
-            error_msg = product.get('error', '')
+            soldout_reason = product.get('soldout_reason', '')
 
-            # 크롤링 실패 (timeout, error 등)
-            if status in ['timeout', 'error', 'failed']:
+            # soldout_reason이 'product_not_found'인 경우 삭제로 판단
+            if soldout_reason == 'product_not_found':
+                deleted['single'].append((product_id, soldout_reason, '상품이 삭제되었습니다'))
+
+            # 크롤링 실패 (timeout, error 등)도 삭제 가능성으로 추가
+            elif product.get('status') in ['timeout', 'error', 'failed']:
+                status = product.get('status')
+                error_msg = product.get('error', '')
                 deleted['single'].append((product_id, status, error_msg))
-
-            # product_status가 unknown인 경우도 삭제 가능성
-            elif product.get('product_status') == 'unknown':
-                deleted['single'].append((product_id, 'unknown', 'product_status unknown'))
 
         return deleted
 
@@ -474,9 +502,17 @@ class CrawlingResultAnalyzer:
             with open(file2, 'w', encoding='utf-8') as f:
                 f.write("=== 옵션 상품 중 품절된 옵션 ID (옵션별) ===\n")
                 f.write(f"총 {len(option_soldout)}개\n\n")
+
+                f.write("## 상품 ID 목록 (Excel 복사용)\n")
+                for option_id in option_soldout:
+                    # A000000111111_1 -> A000000111111
+                    product_id = option_id.rsplit('_', 1)[0]
+                    f.write(f"oliveyoung_{product_id}\n")
+
+                f.write("\n## 옵션 ID 목록 (Excel 복사용)\n")
                 for option_id in option_soldout:
                     f.write(f"oliveyoung_{option_id}\n")
-            print(f"✅ ���일 2 생성: {file2} ({len(option_soldout)}개)")
+            print(f"✅ 파일 2 생성: {file2} ({len(option_soldout)}개)")
 
             # 3. 성공한 상품 ID
             file3 = output_path / "3_successful_ids.txt"
@@ -519,12 +555,12 @@ class CrawlingResultAnalyzer:
 
             print(f"✅ 파일 4 생성: {file4}")
 
-            # 5. 단품 가격 변경 파일
-            # 6. 옵션 가격 변경 파일
+            # 5-7. 가격 변경 파일들
             if self.excel_price_map:
                 price_changed = self.extract_price_changed_products()
                 single_changed = price_changed['single']
-                option_changed = price_changed['option']
+                option_base_changed = price_changed['option_base']
+                option_additional_changed = price_changed['option_additional']
 
                 # 5. 단품 가격 변경
                 file5 = output_path / "5_price_changed_single.txt"
@@ -548,44 +584,65 @@ class CrawlingResultAnalyzer:
 
                 print(f"✅ 파일 5 생성: {file5} ({len(single_changed)}개)")
 
-                # 6. 옵션 가격 변경
-                file6 = output_path / "6_price_changed_option.txt"
+                # 6. 옵션 상품 기본가격 변경
+                file6 = output_path / "6_price_changed_option_base.txt"
                 with open(file6, 'w', encoding='utf-8') as f:
-                    f.write("=== 옵션 상품 가격 변경 ===\n")
-                    f.write(f"총 {len(option_changed)}개\n\n")
+                    f.write("=== 옵션 상품 기본가격 변경 ⚠️ 먼저 업데이트 ===\n")
+                    f.write(f"총 {len(option_base_changed)}개\n\n")
 
                     f.write("## 상품 ID 목록 (Excel 복사용)\n")
-                    for product_id, option_id, old_price, new_price in option_changed:
+                    for product_id, option_id, old_base, new_base in option_base_changed:
+                        f.write(f"oliveyoung_{product_id}\n")
+
+                    f.write("\n## 새 기본가격(엔화) 목록 (Excel 복사용)\n")
+                    for product_id, option_id, old_base, new_base in option_base_changed:
+                        f.write(f"{new_base}\n")
+
+                    f.write("\n## 상세 정보\n")
+                    for product_id, option_id, old_base, new_base in option_base_changed:
+                        diff = new_base - old_base
+                        sign = "+" if diff > 0 else ""
+                        f.write(f"oliveyoung_{product_id}: {old_base}엔 → {new_base}엔 ({sign}{diff}엔)\n")
+
+                print(f"✅ 파일 6 생성: {file6} ({len(option_base_changed)}개)")
+
+                # 7. 옵션 차액 변경
+                file7 = output_path / "7_price_changed_option_additional.txt"
+                with open(file7, 'w', encoding='utf-8') as f:
+                    f.write("=== 옵션 차액 변경 ⚠️ 기본가격 업데이트 후 처리 ===\n")
+                    f.write(f"총 {len(option_additional_changed)}개\n\n")
+
+                    f.write("## 상품 ID 목록 (Excel 복사용)\n")
+                    for product_id, option_id, old_additional, new_additional in option_additional_changed:
                         f.write(f"oliveyoung_{product_id}\n")
 
                     f.write("\n## 옵션 ID 목록 (Excel 복사용)\n")
-                    for product_id, option_id, old_price, new_price in option_changed:
+                    for product_id, option_id, old_additional, new_additional in option_additional_changed:
                         f.write(f"oliveyoung_{option_id}\n")
 
-                    f.write("\n## 새 가격(엔화) 목록 (Excel 복사용)\n")
-                    for product_id, option_id, old_price, new_price in option_changed:
-                        f.write(f"{new_price}\n")
+                    f.write("\n## 새 차액(엔화) 목록 (Excel 복사용)\n")
+                    for product_id, option_id, old_additional, new_additional in option_additional_changed:
+                        f.write(f"{new_additional}\n")
 
                     f.write("\n## 상세 정보\n")
-                    for product_id, option_id, old_price, new_price in option_changed:
-                        diff = new_price - old_price
+                    for product_id, option_id, old_additional, new_additional in option_additional_changed:
+                        diff = new_additional - old_additional
                         sign = "+" if diff > 0 else ""
-                        f.write(f"oliveyoung_{product_id} / oliveyoung_{option_id}: {old_price}엔 → {new_price}엔 ({sign}{diff}엔)\n")
+                        f.write(f"oliveyoung_{product_id} / oliveyoung_{option_id}: 차액 {old_additional}엔 → {new_additional}엔 ({sign}{diff}엔)\n")
 
-                print(f"✅ 파일 6 생성: {file6} ({len(option_changed)}개)")
+                print(f"✅ 파일 7 생성: {file7} ({len(option_additional_changed)}개)")
 
-            # 7. 단품 복구 상품 (품절→판매중)
-            # 8. 옵션 복구 상품
-            file_count = 6 if self.excel_price_map else 4
+            # 8-9. 복구 상품들
+            file_count = 7 if self.excel_price_map else 4
 
             if self.excel_quantity_map:
                 restocked = self.extract_restocked_products()
                 single_restocked = restocked['single']
                 option_restocked = restocked['option']
 
-                # 7. 단품 복구
-                file7 = output_path / "7_restocked_single.txt"
-                with open(file7, 'w', encoding='utf-8') as f:
+                # 8. 단품 복구
+                file8 = output_path / "8_restocked_single.txt"
+                with open(file8, 'w', encoding='utf-8') as f:
                     f.write("=== 단품 복구 (품절→판매중) ===\n")
                     f.write(f"총 {len(single_restocked)}개\n\n")
 
@@ -597,11 +654,11 @@ class CrawlingResultAnalyzer:
                     for product_id, old_qty, new_status in single_restocked:
                         f.write(f"oliveyoung_{product_id}: 품절(재고={old_qty}) → {new_status}\n")
 
-                print(f"✅ 파일 7 생성: {file7} ({len(single_restocked)}개)")
+                print(f"✅ 파일 8 생성: {file8} ({len(single_restocked)}개)")
 
-                # 8. 옵션 복구
-                file8 = output_path / "8_restocked_option.txt"
-                with open(file8, 'w', encoding='utf-8') as f:
+                # 9. 옵션 복구
+                file9 = output_path / "9_restocked_option.txt"
+                with open(file9, 'w', encoding='utf-8') as f:
                     f.write("=== 옵션 복구 (품절→판매중) ===\n")
                     f.write(f"총 {len(option_restocked)}개\n\n")
 
@@ -617,16 +674,16 @@ class CrawlingResultAnalyzer:
                     for product_id, option_id, old_qty, new_status in option_restocked:
                         f.write(f"oliveyoung_{product_id} / oliveyoung_{option_id}: 품절(재고={old_qty}) → {new_status}\n")
 
-                print(f"✅ 파일 8 생성: {file8} ({len(option_restocked)}개)")
+                print(f"✅ 파일 9 생성: {file9} ({len(option_restocked)}개)")
 
                 file_count += 2
 
-            # 9. 삭제 가능성 상품
+            # 10. 삭제 가능성 상품
             deleted = self.extract_deleted_products()
             deleted_products = deleted['single']
 
-            file9 = output_path / "9_deleted_products.txt"
-            with open(file9, 'w', encoding='utf-8') as f:
+            file10 = output_path / "10_deleted_products.txt"
+            with open(file10, 'w', encoding='utf-8') as f:
                 f.write("=== 삭제 가능성 상품 (크롤링 실패) ===\n")
                 f.write(f"총 {len(deleted_products)}개\n\n")
 
@@ -638,10 +695,62 @@ class CrawlingResultAnalyzer:
                 for product_id, status, error in deleted_products:
                     f.write(f"oliveyoung_{product_id}: {status} - {error}\n")
 
-            print(f"✅ 파일 9 생성: {file9} ({len(deleted_products)}개)")
+            print(f"✅ 파일 10 생성: {file10} ({len(deleted_products)}개)")
+            file_count += 1
+
+            # 11. 업데이트 순서 안내 파일
+            file11 = output_path / "00_UPDATE_ORDER.txt"
+            with open(file11, 'w', encoding='utf-8') as f:
+                f.write("=" * 60 + "\n")
+                f.write("📋 올리브영 가격 업데이트 순서 안내\n")
+                f.write("=" * 60 + "\n\n")
+
+                f.write("⚠️  반드시 아래 순서대로 Excel 업데이트를 진행하세요!\n\n")
+
+                f.write("=" * 60 + "\n")
+                f.write("1단계: 단품 상품 가격 업데이트\n")
+                f.write("=" * 60 + "\n")
+                f.write("파일: 5_price_changed_single.txt\n")
+                f.write("내용: 단품 상품의 기본 가격(price_yen) 변경\n\n")
+
+                f.write("=" * 60 + "\n")
+                f.write("2단계: 옵션 상품 기본가격 업데이트 ⚠️ 먼저 처리\n")
+                f.write("=" * 60 + "\n")
+                f.write("파일: 6_price_changed_option_base.txt\n")
+                f.write("내용: 옵션 상품의 기본 가격(price_yen) 변경\n")
+                f.write("주의: 이 파일을 먼저 처리해야 합니다!\n\n")
+
+                f.write("=" * 60 + "\n")
+                f.write("3단계: 옵션 차액 업데이트 ⚠️ 나중에 처리\n")
+                f.write("=" * 60 + "\n")
+                f.write("파일: 7_price_changed_option_additional.txt\n")
+                f.write("내용: 옵션별 추가 가격 차액 변경\n")
+                f.write("주의: 반드시 2단계 완료 후 처리하세요!\n\n")
+
+                f.write("=" * 60 + "\n")
+                f.write("4단계: 기타 업데이트\n")
+                f.write("=" * 60 + "\n")
+                f.write("- 1_single_soldout_ids.txt: 단품 품절 상품\n")
+                f.write("- 2_option_soldout_ids.txt: 옵션 품절 상품\n")
+                f.write("- 8_restocked_single.txt: 품절→판매중 복구 (단품)\n")
+                f.write("- 9_restocked_option.txt: 품절→판매중 복구 (옵션)\n")
+                f.write("- 10_deleted_products.txt: 삭제 가능성 상품\n\n")
+
+                f.write("=" * 60 + "\n")
+                f.write("💡 왜 순서가 중요한가요?\n")
+                f.write("=" * 60 + "\n")
+                f.write("옵션 가격 = 기본 가격(price_yen) + 옵션 차액\n\n")
+                f.write("만약 순서를 바꾸면:\n")
+                f.write("❌ 차액을 먼저 변경 → 잘못된 전체 가격 계산\n")
+                f.write("✅ 기본가를 먼저 변경 → 차액 변경 → 올바른 전체 가격\n\n")
+
+                f.write("=" * 60 + "\n\n")
+
+            print(f"✅ 안내 파일 생성: {file11}")
             file_count += 1
 
             print(f"\n🎉 총 {file_count}개 파일 생성 완료!")
+            print(f"📋 업데이트 순서는 00_UPDATE_ORDER.txt 파일을 참고하세요!")
             return True
 
         except Exception as e:
@@ -679,8 +788,9 @@ def main():
     if analyzer.excel_price_map:
         price_changed = analyzer.extract_price_changed_products()
         single_count = len(price_changed['single'])
-        option_count = len(price_changed['option'])
-        print(f"💰 가격 변경 - 단품: {single_count}개, 옵션: {option_count}개")
+        option_base_count = len(price_changed['option_base'])
+        option_additional_count = len(price_changed['option_additional'])
+        print(f"💰 가격 변경 - 단품: {single_count}개, 옵션기본가: {option_base_count}개, 옵션차액: {option_additional_count}개")
 
     # 복구 상품 통계
     if analyzer.excel_quantity_map:
@@ -696,8 +806,7 @@ def main():
 
     if not args.stats_only:
         # 파일 생성
-        file_count = '6' if analyzer.excel_price_map else '4'
-        print(f"\n💾 {file_count}개 파일 생성 중...")
+        print(f"\n💾 파일 생성 중...")
         analyzer.save_four_files(args.output_dir)
 
     return 0
