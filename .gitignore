@@ -42,5 +42,5 @@ Thumbs.db
 temp/
 tmp/
 
-# 결과 파일
-*.txt
+# 출력 파일
+output/

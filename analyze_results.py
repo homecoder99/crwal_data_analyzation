@@ -765,8 +765,8 @@ def main():
                        help='크롤링 결과 JSON 파일 (기본값: olive_young_products.json)')
     parser.add_argument('--excel', '-e', default='data/Qoo10_ItemInfo.xlsx',
                        help='Excel 파일 경로 (기본값: data/Qoo10_ItemInfo.xlsx)')
-    parser.add_argument('--output-dir', '-o', default='.',
-                       help='출력 디렉토리 (기본값: 현재 디렉토리)')
+    parser.add_argument('--output-dir', '-o', default='output',
+                       help='출력 디렉토리 (기본값: output)')
     parser.add_argument('--stats-only', action='store_true',
                        help='통계만 출력하고 파일 저장하지 않음')
 
