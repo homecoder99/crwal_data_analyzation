@@ -5,8 +5,12 @@ description = "Olive Young product crawler"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    # 의존성은 requirements.txt에서 관리
-    # uv pip install -r requirements.txt 사용
+    "pandas>=2.3.3",
+    "openpyxl>=3.1.5",
+    "playwright>=1.40.0",
+    "aiofiles>=23.2.1",
+    "tqdm>=4.66.1",
+    "asyncio-throttle>=1.0.1",
 ]
 
 [project.optional-dependencies]

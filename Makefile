@@ -81,8 +81,8 @@ analyze-stats:
 
 # 업데이트용 Excel 파일 생성
 generate-excel:
-	uv run python generate_update_excel.py
-	uv run python generate_delete_excel.py
+	source .venv/bin/activate && python generate_update_excel.py
+	source .venv/bin/activate && python generate_delete_excel.py
 
 # 테스트 데이터 생성
 generate-test-data:

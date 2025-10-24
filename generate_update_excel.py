@@ -139,9 +139,18 @@ class UpdateExcelGenerator:
         if Path(restock_file).exists():
             with open(restock_file, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
+                in_id_section = False
                 for line in lines:
                     line = line.strip()
-                    if line.startswith('oliveyoung_'):
+                    # ID 목록 섹션 시작
+                    if line == '## 상품 ID 목록 (Excel 복사용)':
+                        in_id_section = True
+                        continue
+                    # 다음 섹션 시작하면 종료
+                    if in_id_section and line.startswith('##'):
+                        break
+                    # ID만 읽기
+                    if in_id_section and line.startswith('oliveyoung_'):
                         rows.append({
                             'seller_unique_item_id': line,
                             'seller_unique_option_id': '',
