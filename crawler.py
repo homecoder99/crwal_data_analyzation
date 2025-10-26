@@ -148,7 +148,7 @@ class OliveYoungOptionExtractor:
             # 옵션 목록 로딩 대기
             try:
                 await page.wait_for_selector('#option_list li', timeout=8000)
-                await asyncio.sleep(2)  # 2초 대기로 변경
+                await asyncio.sleep(random.uniform(0.25, 0.5))
 
                 # 옵션 아이템 추출
                 option_items = page.locator('#option_list li')
